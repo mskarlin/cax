@@ -10,11 +10,14 @@ from cax.core.update import ResidualUpdate
 
 
 class TransformerDistillUpdate(ResidualUpdate):
-	"""Update module for transformer distillation.
+	"""3D update module for transformer distillation.
 
 	Extends ResidualUpdate with GELU activation (matching GPT-2) and
-	smaller step size for stable training. Does not use alive masking
-	since all positions in transformer activations are active.
+	smaller step size for stable training. Operates on a 3D spatial grid
+	(seq_len, compressed_dim, state_depth).
+
+	Does not use alive masking since all positions in transformer
+	activations are active.
 
 	"""
 
@@ -22,7 +25,7 @@ class TransformerDistillUpdate(ResidualUpdate):
 		self,
 		channel_size: int,
 		perception_size: int,
-		hidden_layer_sizes: tuple[int, ...] = (256, 256),
+		hidden_layer_sizes: tuple[int, ...] = (256,),
 		*,
 		activation_fn: Callable = nnx.gelu,
 		step_size: float = 0.1,
@@ -30,7 +33,7 @@ class TransformerDistillUpdate(ResidualUpdate):
 		zeros_init: bool = True,
 		rngs: nnx.Rngs,
 	):
-		"""Initialize the update module.
+		"""Initialize the 3D update module.
 
 		Args:
 			channel_size: Number of channels in the NCA state.
@@ -44,7 +47,7 @@ class TransformerDistillUpdate(ResidualUpdate):
 
 		"""
 		super().__init__(
-			num_spatial_dims=2,  # 2D grid (seq_len x hidden_dim)
+			num_spatial_dims=3,  # 3D grid (seq_len x compressed_dim x state_depth)
 			channel_size=channel_size,
 			perception_size=perception_size,
 			hidden_layer_sizes=hidden_layer_sizes,
@@ -61,8 +64,8 @@ class TransformerDistillUpdate(ResidualUpdate):
 		Uses residual update: state += step_size * dropout(mlp(perception))
 
 		Args:
-			state: Current NCA state (..., seq_len, hidden_dim, channel_size).
-			perception: Current perception (..., seq_len, hidden_dim, perception_size).
+			state: Current NCA state (..., seq_len, compressed_dim, state_depth, channel_size).
+			perception: Current perception (..., seq_len, compressed_dim, state_depth, perception_size).
 			input: Optional input (not used in standard distillation).
 
 		Returns:
