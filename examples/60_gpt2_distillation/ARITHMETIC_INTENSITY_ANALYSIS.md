@@ -8,11 +8,15 @@ This document summarizes the arithmetic intensity (AI) analysis for Neural Cellu
 |----------|-----------------|-------|-------|
 | Transformer decode (autoregressive) | ~1 | Memory | KV cache bottleneck |
 | NCA naive (per-step HBM) | ~17 | Memory | Repeated state R/W |
-| A100 compute-bound threshold | ~156 | — | Hardware dependent |
-| **NCA tiled (4-step fusion)** | **~235-306** | **Compute** | Target architecture |
+| A100 HBM threshold | ~156 | — | 312 TFLOPs / 2.0 TB/s |
+| A100 L2 threshold | ~62 | — | 312 TFLOPs / 5.0 TB/s |
+| **NCA tiled (vs HBM)** | **~306** | **Compute** | State I/O to HBM |
+| **NCA tiled (vs L2)** | **~253** | **Compute** | Weight streaming from L2 |
 | Flash Attention prefill (S=4K) | ~2,048 | Compute | O(S²) scaling |
 
-**Key insight**: Autoregressive transformer decoding (~1 FLOPs/byte) is significantly more memory-bound than even naive NCA (~17 FLOPs/byte). With multi-step fusion, NCAs can achieve ~235+ FLOPs/byte, making them solidly compute-bound and potentially much faster at inference.
+**Key insight**: Autoregressive transformer decoding (~1 FLOPs/byte) is significantly more memory-bound than even naive NCA (~17 FLOPs/byte). With multi-step fusion, NCAs achieve ~306 FLOPs/byte (vs HBM) and ~253 FLOPs/byte (vs L2), exceeding *both* thresholds and making them solidly compute-bound.
+
+**Memory hierarchy note**: The fusion strategy uses a hybrid approach—tile state in SRAM, weights streaming from L2 cache. Because L2 has higher bandwidth (~5 TB/s vs 2 TB/s), its compute-bound threshold is *lower* (~62 vs ~156), making L2 weight streaming easier to hide, not harder.
 
 ---
 
@@ -381,6 +385,101 @@ For 8³ interior tile, 4 fused steps:
 
 This exceeds the A100 compute-bound threshold (~156 FLOPs/byte).
 
+### SRAM Capacity Constraints and Realistic Memory Hierarchy
+
+**Critical caveat**: The above AI calculation assumes weights are "amortized" across tiles. In reality, we must consider where data physically resides during fusion.
+
+#### What Needs to Fit Together?
+
+| Component | Size (FP32) | Size (BF16) |
+|-----------|-------------|-------------|
+| Tile + halo (16³×16) | 262 KB | 131 KB |
+| Weights (perception + MLP) | 89 KB | 44.5 KB |
+| Intermediate activations | ~64 KB | ~32 KB |
+| **Total if all in SRAM** | **~415 KB** | **~208 KB** |
+| A100 Shared Memory/SM | 192 KB | 192 KB |
+
+**Problem**: Even with BF16, tile state + weights + activations exceed shared memory capacity.
+
+#### Realistic Memory Hierarchy Strategy
+
+The fusion actually works with a **hybrid L2/SRAM approach**:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ HBM (2 TB/s)                                            │
+│   └── Full state grid, initial read / final write       │
+├─────────────────────────────────────────────────────────┤
+│ L2 Cache (40 MB, ~5 TB/s effective)                     │
+│   └── Weights (89 KB) - loaded once, reused all tiles   │
+├─────────────────────────────────────────────────────────┤
+│ Shared Memory (192 KB/SM)                               │
+│   └── Tile + halo state during N fused steps            │
+│   └── Streaming window for activations                  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Key insight**: Weights stream from L2 cache (not SRAM) during computation. This works because:
+1. Weights (89 KB) easily fit in L2 cache (40 MB)
+2. L2→SM bandwidth (~5 TB/s) is ~2.5× faster than HBM→SM (2 TB/s)
+3. Weights are accessed predictably, enabling effective prefetching
+
+#### Revised AI Calculation (Checking Both Memory Levels)
+
+For 8³ interior tile, 4 fused steps, with L2 weight streaming:
+
+**Memory traffic:**
+```
+HBM traffic (state I/O):
+  Read tile+halo:  262 KB
+  Write interior:   32 KB
+  Subtotal:        294 KB
+
+L2 traffic (weights, per tile):
+  4 steps × 89 KB = 356 KB
+```
+
+**Compute-bound analysis requires checking each memory level separately:**
+
+Since L2 has higher bandwidth than HBM (~5 TB/s vs 2 TB/s on A100), its compute-bound threshold is *lower*:
+```
+AI_threshold_HBM = 312 TFLOPs / 2.0 TB/s = 156 FLOPs/byte
+AI_threshold_L2  = 312 TFLOPs / 5.0 TB/s =  62 FLOPs/byte
+```
+
+**Per-memory-level AI:**
+```
+AI_HBM = 90 MFLOPs / 294 KB = 306 FLOPs/byte  > 156 ✓ compute-bound
+AI_L2  = 90 MFLOPs / 356 KB = 253 FLOPs/byte  >  62 ✓ compute-bound
+```
+
+**Result**: We exceed the compute-bound threshold for *both* memory levels. The L2 weight streaming is not a bottleneck—L2's higher bandwidth makes it easier to saturate compute, not harder.
+
+This is actually better than the idealized analysis suggested: we're solidly compute-bound even when properly accounting for the hybrid memory hierarchy.
+
+#### When Does This Scheme Break Down?
+
+| Scenario | Problem | Mitigation |
+|----------|---------|------------|
+| Larger MLP (M > 512) | Weights exceed L2 working set | Reduce tile size, accept lower η |
+| Many channels (C > 32) | Tile state exceeds SRAM | Smaller tiles, fewer fused steps |
+| More fused steps (N > 6) | Halo grows, tile efficiency drops | Cap at N=4-6 |
+| L2 cache pressure | Weight eviction, HBM fallback | Dedicated L2 partitioning (if available) |
+
+#### BF16 Enables Larger Tiles
+
+With BF16 precision:
+```
+Tile + halo (16³×16, BF16):  131 KB  ← fits in 192 KB SRAM!
+Weights in L2:                44.5 KB
+Activations (streaming):     ~32 KB
+```
+
+BF16 makes the scheme more robust by:
+1. Halving state memory → larger tiles possible
+2. Halving weight traffic → less L2 pressure
+3. Enabling potential 20³ tiles with 4-step fusion
+
 ---
 
 ## 5. Comparison with Transformer Attention
@@ -496,15 +595,50 @@ def nca_fused_kernel(state_ref, output_ref, weights_ref):
 
 ## 8. Hardware Considerations
 
-### Compute-Bound Thresholds
+### Compute-Bound Thresholds by Memory Level
 
-| GPU | Peak TFLOPs (FP16) | HBM Bandwidth | AI Threshold |
-|-----|-------------------|---------------|--------------|
-| A100 | 312 | 2.0 TB/s | ~156 |
-| H100 | 990 | 3.35 TB/s | ~296 |
-| V100 | 125 | 900 GB/s | ~139 |
+The compute-bound threshold depends on which memory level is the bottleneck:
 
-NCA with 4-step fusion (~235-306 FLOPs/byte) is compute-bound on A100, borderline on H100.
+```
+AI_threshold = Peak Compute (FLOPs/s) / Memory Bandwidth (bytes/s)
+```
+
+| GPU | Peak TFLOPs (FP16) | HBM BW | HBM Threshold | L2 BW | L2 Threshold |
+|-----|-------------------|--------|---------------|-------|--------------|
+| A100 | 312 | 2.0 TB/s | ~156 | ~5 TB/s | ~62 |
+| H100 | 990 | 3.35 TB/s | ~296 | ~12 TB/s | ~82 |
+| V100 | 125 | 900 GB/s | ~139 | ~3 TB/s | ~42 |
+
+**Key insight**: L2 cache has much higher bandwidth than HBM, so its compute-bound threshold is *lower* (easier to achieve).
+
+### Are We Compute-Bound? (Checking Both Memory Levels)
+
+For our fused NCA kernel, we must check compute-boundedness against each memory level separately:
+
+**Per-tile metrics (8³ interior, 4 fused steps):**
+```
+Compute:     90 MFLOPs
+HBM traffic: 294 KB (state read/write)
+L2 traffic:  356 KB (weights × 4 steps)
+```
+
+**Arithmetic Intensity by memory level:**
+```
+AI_HBM = 90 MFLOPs / 294 KB = 306 FLOPs/byte
+AI_L2  = 90 MFLOPs / 356 KB = 253 FLOPs/byte
+```
+
+**Compute-bound check:**
+
+| GPU | AI_HBM vs Threshold | AI_L2 vs Threshold | Status |
+|-----|--------------------|--------------------|--------|
+| A100 | 306 > 156 ✓ | 253 > 62 ✓ | **Compute-bound** |
+| H100 | 306 > 296 ✓ | 253 > 82 ✓ | **Compute-bound** (barely for HBM) |
+| V100 | 306 > 139 ✓ | 253 > 42 ✓ | **Compute-bound** |
+
+**Result**: We're compute-bound with respect to *both* memory levels on all GPUs. The L2 weight streaming is not a bottleneck because L2's higher bandwidth lowers its threshold significantly.
+
+**H100 note**: On H100, we're only ~3% above the HBM threshold (306 vs 296). Larger tiles or more fused steps would provide more headroom.
 
 ### Memory Hierarchy Utilization
 
@@ -522,9 +656,18 @@ HBM (slow, large)          → Full state, initial/final I/O
 The arithmetic intensity analysis reveals that:
 
 1. **Naive NCA** (~17 FLOPs/byte) is memory-bound but already better than transformer decoding
-2. **Tiled multi-step fusion** achieves ~235-306 FLOPs/byte, making NCA compute-bound
+2. **Tiled multi-step fusion** achieves ~306 FLOPs/byte (vs HBM) and ~253 FLOPs/byte (vs L2), exceeding compute-bound thresholds for both memory levels
 3. **Transformer decoding** (~1 FLOPs/byte) is severely memory-bound
-4. **The 235× AI improvement** of fused NCA over transformer decoding represents significant inference speedup potential
+4. **The ~300× AI improvement** of fused NCA over transformer decoding represents significant inference speedup potential
+
+**Memory hierarchy reality**: The fusion strategy requires careful placement of data:
+- **Tile state** must fit in SRAM (shared memory) for multi-step fusion to work
+- **Weights** stream from L2 cache—and because L2 bandwidth is higher (~5 TB/s vs 2 TB/s), the L2 threshold is *lower* (~62 vs ~156), making weight streaming easier to hide
+- **Full state grid** lives in HBM, accessed only at tile boundaries
+
+**Compute-bound verification**: We must check AI against *each* memory level's threshold separately. Because L2 has higher bandwidth, its threshold is lower, not higher. Our workload exceeds both thresholds, confirming we're compute-bound.
+
+**Scaling constraints**: The scheme works well for small-to-medium NCAs (M ≤ 512, C ≤ 32) but may degrade with larger models due to L2 cache pressure and reduced tile efficiency.
 
 This makes NCA an attractive target architecture for distillation when inference efficiency is critical, particularly for:
 - Real-time applications
