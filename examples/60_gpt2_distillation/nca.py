@@ -196,3 +196,47 @@ def count_params(nca: GPT2BlockNCA) -> int:
 
 	params = nnx.state(nca, nnx.Param)
 	return sum(x.size for x in jax.tree.leaves(params))
+
+
+def create_gpt2_nca(
+	use_fusion: bool = False,
+	tile_interior_size: tuple[int, int, int] = (8, 8, 8),
+	num_fused_steps: int = 4,
+	use_gradient_checkpointing: bool = True,
+	**kwargs,
+) -> ComplexSystem:
+	"""Factory function to create GPT-2 NCA with optional fusion.
+
+	Args:
+		use_fusion: Whether to use fused tiled execution.
+		tile_interior_size: Interior size of each tile (for fused mode).
+		num_fused_steps: Number of NCA steps to fuse (for fused mode).
+		use_gradient_checkpointing: Whether to use gradient checkpointing (for fused mode).
+		**kwargs: Additional arguments passed to NCA constructor.
+
+	Returns:
+		GPT2BlockNCA or FusedGPT2BlockNCA instance.
+
+	Example:
+		>>> # Standard NCA (naive execution)
+		>>> nca = create_gpt2_nca(use_fusion=False, rngs=rngs)
+
+		>>> # Fused NCA (high arithmetic intensity)
+		>>> nca = create_gpt2_nca(
+		...     use_fusion=True,
+		...     tile_interior_size=(8, 8, 8),
+		...     num_fused_steps=4,
+		...     rngs=rngs,
+		... )
+
+	"""
+	if use_fusion:
+		from .fused_nca import FusedGPT2BlockNCA
+
+		return FusedGPT2BlockNCA(
+			tile_interior_size=tile_interior_size,
+			num_fused_steps=num_fused_steps,
+			use_gradient_checkpointing=use_gradient_checkpointing,
+			**kwargs,
+		)
+	return GPT2BlockNCA(**kwargs)
